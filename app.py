@@ -9,6 +9,33 @@ from lxml import etree
 
 st.set_page_config(page_title="PDF2UBL - Convertisseur Peppol", layout="wide", page_icon="📄")
 
+# --- VÉRIFICATION DU MOT DE PASSE ---
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    # Récupère le mot de passe défini dans les Secrets Streamlit
+    secret_pwd = st.secrets.get("APP_PASSWORD")
+
+    col_login, _ = st.columns([1, 2])
+    with col_login:
+        st.markdown("### 🔒 Accès restreint")
+        pwd_input = st.text_input("Veuillez saisir le mot de passe :", type="password")
+        if st.button("Se connecter"):
+            if pwd_input == secret_pwd:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Mot de passe incorrect.")
+    return False
+
+if not check_password():
+    st.stop()  # Bloque l'application tant que le mot de passe n'est pas validé
+# -------------------------------------
+
 def clean_vat(vat_str: str) -> str:
     if not vat_str:
         return ""
