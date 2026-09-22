@@ -17,7 +17,6 @@ def check_password():
     if st.session_state.authenticated:
         return True
 
-    # Récupère le mot de passe défini dans les Secrets Streamlit
     secret_pwd = st.secrets.get("APP_PASSWORD")
 
     col_login, _ = st.columns([1, 2])
@@ -33,7 +32,7 @@ def check_password():
     return False
 
 if not check_password():
-    st.stop()  # Bloque l'application tant que le mot de passe n'est pas validé
+    st.stop()
 # -------------------------------------
 
 def clean_vat(vat_str: str) -> str:
@@ -43,6 +42,19 @@ def clean_vat(vat_str: str) -> str:
     if len(cleaned) == 10 and not cleaned.startswith("BE"):
         cleaned = "BE" + cleaned
     return cleaned
+
+def detect_vat_rate(text: str) -> float:
+    """Détecte le taux de TVA prédominant dans le document, sinon repli sur 21%."""
+    t_lower = text.lower()
+    if "cocontractant" in t_lower or "autoliquidation" in t_lower or "reverse charge" in t_lower:
+        return 0.0
+    if re.search(r"\b6(\s?%|\.00%|,00%)\b", text):
+        return 6.0
+    if re.search(r"\b12(\s?%|\.00%|,00%)\b", text):
+        return 12.0
+    if re.search(r"\b0(\s?%|\.00%|,00%)\b", text):
+        return 0.0
+    return 21.0
 
 def parse_pdf_data(file_bytes: bytes) -> dict:
     text = ""
@@ -81,8 +93,15 @@ def parse_pdf_data(file_bytes: bytes) -> dict:
             pass
 
     gross_amount = max(parsed_floats) if parsed_floats else 0.0
-    net_amount = round(gross_amount / 1.21, 2) if gross_amount > 0 else 0.0
-    tax_amount = round(gross_amount - net_amount, 2)
+    detected_rate = detect_vat_rate(text)
+
+    # Calcul dynamique selon le taux détecté
+    if detected_rate > 0:
+        net_amount = round(gross_amount / (1 + (detected_rate / 100)), 2)
+        tax_amount = round(gross_amount - net_amount, 2)
+    else:
+        net_amount = gross_amount
+        tax_amount = 0.0
 
     return {
         "invoice_id": "INV-" + datetime.today().strftime("%Y%m%d%H%M"),
@@ -91,6 +110,7 @@ def parse_pdf_data(file_bytes: bytes) -> dict:
         "supplier_name": "Fournisseur Identifié",
         "supplier_vat": supplier_vat,
         "vcs": vcs,
+        "rate": detected_rate,
         "net_amount": net_amount,
         "tax_amount": tax_amount,
         "gross_amount": gross_amount,
@@ -139,6 +159,18 @@ def generate_ubl_xml(data: dict, pdf_bytes: bytes, filename: str) -> bytes:
     taxtotal = etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxTotal")
     etree.SubElement(taxtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxAmount", currencyID="EUR").text = f"{data['tax_amount']:.2f}"
 
+    # Sous-total TVA par catégorie
+    tax_subtotal = etree.SubElement(taxtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxSubtotal")
+    etree.SubElement(tax_subtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxableAmount", currencyID="EUR").text = f"{data['net_amount']:.2f}"
+    etree.SubElement(tax_subtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxAmount", currencyID="EUR").text = f"{data['tax_amount']:.2f}"
+    
+    tax_category = etree.SubElement(tax_subtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxCategory")
+    tax_category_id = "S" if data["rate"] > 0 else "K"  # S = Standard, K = Autoliquidation/Cocontractant
+    etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = tax_category_id
+    etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}Percent").text = f"{data['rate']:.2f}"
+    tax_cat_scheme = etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxScheme")
+    etree.SubElement(tax_cat_scheme, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = "VAT"
+
     # LegalMonetaryTotal
     legal = etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}LegalMonetaryTotal")
     etree.SubElement(legal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}LineExtensionAmount", currencyID="EUR").text = f"{data['net_amount']:.2f}"
@@ -175,9 +207,22 @@ if uploaded_files:
                 issue_d = st.text_input("Date Facture (AAAA-MM-JJ)", value=parsed["issue_date"], key=f"date_{idx}")
                 due_d = st.text_input("Échéance (AAAA-MM-JJ)", value=parsed["due_date"], key=f"due_{idx}")
             with col4:
-                htva = st.number_input("Montant HTVA (€)", value=parsed["net_amount"], step=0.01, format="%.2f", key=f"ht_{idx}")
-                tva = st.number_input("Montant TVA (€)", value=parsed["tax_amount"], step=0.01, format="%.2f", key=f"tva_{idx}")
+                rates_available = [21.0, 12.0, 6.0, 0.0]
+                default_idx = rates_available.index(parsed["rate"]) if parsed["rate"] in rates_available else 0
+                chosen_rate = st.selectbox("Taux TVA (%)", rates_available, index=default_idx, key=f"rate_{idx}")
+                
                 ttc = st.number_input("Total TTC (€)", value=parsed["gross_amount"], step=0.01, format="%.2f", key=f"ttc_{idx}")
+                
+                # Recalcul automatique selon le taux choisi
+                if chosen_rate > 0:
+                    calc_ht = round(ttc / (1 + (chosen_rate / 100)), 2)
+                    calc_tva = round(ttc - calc_ht, 2)
+                else:
+                    calc_ht = ttc
+                    calc_tva = 0.0
+
+                htva = st.number_input("Montant HTVA (€)", value=calc_ht, step=0.01, format="%.2f", key=f"ht_{idx}")
+                tva = st.number_input("Montant TVA (€)", value=calc_tva, step=0.01, format="%.2f", key=f"tva_{idx}")
 
             final_data = {
                 "invoice_id": inv_id,
@@ -186,6 +231,7 @@ if uploaded_files:
                 "vcs": vcs,
                 "issue_date": issue_d,
                 "due_date": due_d,
+                "rate": chosen_rate,
                 "net_amount": htva,
                 "tax_amount": tva,
                 "gross_amount": ttc,
