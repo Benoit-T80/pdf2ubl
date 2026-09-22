@@ -43,18 +43,20 @@ def clean_vat(vat_str: str) -> str:
         cleaned = "BE" + cleaned
     return cleaned
 
-def detect_vat_rate(text: str) -> float:
-    """Détecte le taux de TVA prédominant dans le document, sinon repli sur 21%."""
+def detect_regime(text: str) -> str:
+    """Détecte le régime fiscal et le taux prédominant."""
     t_lower = text.lower()
-    if "cocontractant" in t_lower or "autoliquidation" in t_lower or "reverse charge" in t_lower:
-        return 0.0
+    if "cocontractant" in t_lower or "medecontractant" in t_lower or "ar n°1" in t_lower:
+        return "Cocontractant (0% - Case 87)"
+    if "intracommunautaire" in t_lower or "intra-communautaire" in t_lower or "ic" in t_lower:
+        return "Intracommunautaire (0% - Case 86)"
     if re.search(r"\b6(\s?%|\.00%|,00%)\b", text):
-        return 6.0
+        return "Taux réduit 6%"
     if re.search(r"\b12(\s?%|\.00%|,00%)\b", text):
-        return 12.0
+        return "Taux intermédiaire 12%"
     if re.search(r"\b0(\s?%|\.00%|,00%)\b", text):
-        return 0.0
-    return 21.0
+        return "Exonéré / Art. 44 (0%)"
+    return "Taux standard 21%"
 
 def parse_pdf_data(file_bytes: bytes) -> dict:
     text = ""
@@ -93,15 +95,7 @@ def parse_pdf_data(file_bytes: bytes) -> dict:
             pass
 
     gross_amount = max(parsed_floats) if parsed_floats else 0.0
-    detected_rate = detect_vat_rate(text)
-
-    # Calcul dynamique selon le taux détecté
-    if detected_rate > 0:
-        net_amount = round(gross_amount / (1 + (detected_rate / 100)), 2)
-        tax_amount = round(gross_amount - net_amount, 2)
-    else:
-        net_amount = gross_amount
-        tax_amount = 0.0
+    regime = detect_regime(text)
 
     return {
         "invoice_id": "INV-" + datetime.today().strftime("%Y%m%d%H%M"),
@@ -110,9 +104,7 @@ def parse_pdf_data(file_bytes: bytes) -> dict:
         "supplier_name": "Fournisseur Identifié",
         "supplier_vat": supplier_vat,
         "vcs": vcs,
-        "rate": detected_rate,
-        "net_amount": net_amount,
-        "tax_amount": tax_amount,
+        "regime": regime,
         "gross_amount": gross_amount,
     }
 
@@ -124,6 +116,7 @@ def generate_ubl_xml(data: dict, pdf_bytes: bytes, filename: str) -> bytes:
     }
     root = etree.Element("Invoice", nsmap=nsmap)
 
+    # Entête Peppol BIS 3.0 / EN 16931
     etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}CustomizationID").text = "urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0"
     etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ProfileID").text = "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0"
     etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = str(data["invoice_id"])
@@ -132,7 +125,7 @@ def generate_ubl_xml(data: dict, pdf_bytes: bytes, filename: str) -> bytes:
     etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}InvoiceTypeCode").text = "380"
     etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}DocumentCurrencyCode").text = "EUR"
 
-    # PDF embarqué en Base64
+    # PDF embarqué en Base64 pour l'appariement Virtual Invoice
     add_doc = etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}AdditionalDocumentReference")
     etree.SubElement(add_doc, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = filename
     attach = etree.SubElement(add_doc, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}Attachment")
@@ -149,25 +142,26 @@ def generate_ubl_xml(data: dict, pdf_bytes: bytes, filename: str) -> bytes:
     tscheme = etree.SubElement(ptax, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxScheme")
     etree.SubElement(tscheme, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = "VAT"
 
-    # Communication VCS
+    # Communication structurée
     if data["vcs"]:
         pmeans = etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}PaymentMeans")
         etree.SubElement(pmeans, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}PaymentMeansCode").text = "58"
         etree.SubElement(pmeans, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}PaymentID").text = data["vcs"]
 
-    # TaxTotal
+    # TaxTotal et Grille TVA WinBooks
     taxtotal = etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxTotal")
     etree.SubElement(taxtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxAmount", currencyID="EUR").text = f"{data['tax_amount']:.2f}"
 
-    # Sous-total TVA par catégorie
     tax_subtotal = etree.SubElement(taxtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxSubtotal")
     etree.SubElement(tax_subtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxableAmount", currencyID="EUR").text = f"{data['net_amount']:.2f}"
     etree.SubElement(tax_subtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxAmount", currencyID="EUR").text = f"{data['tax_amount']:.2f}"
-    
+
     tax_category = etree.SubElement(tax_subtotal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxCategory")
-    tax_category_id = "S" if data["rate"] > 0 else "K"  # S = Standard, K = Autoliquidation/Cocontractant
-    etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = tax_category_id
+    etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = data["tax_category_code"]
     etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}Percent").text = f"{data['rate']:.2f}"
+    if data.get("exemption_reason"):
+        etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxExemptionReason").text = data["exemption_reason"]
+
     tax_cat_scheme = etree.SubElement(tax_category, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxScheme")
     etree.SubElement(tax_cat_scheme, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = "VAT"
 
@@ -178,12 +172,38 @@ def generate_ubl_xml(data: dict, pdf_bytes: bytes, filename: str) -> bytes:
     etree.SubElement(legal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}TaxInclusiveAmount", currencyID="EUR").text = f"{data['gross_amount']:.2f}"
     etree.SubElement(legal, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}PayableAmount", currencyID="EUR").text = f"{data['gross_amount']:.2f}"
 
+    # Ligne de facture détaillée pour mapping automatique WinBooks
+    inv_line = etree.SubElement(root, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}InvoiceLine")
+    etree.SubElement(inv_line, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = "1"
+    etree.SubElement(inv_line, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}InvoicedQuantity", unitCode="C62").text = "1"
+    etree.SubElement(inv_line, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}LineExtensionAmount", currencyID="EUR").text = f"{data['net_amount']:.2f}"
+
+    item = etree.SubElement(inv_line, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}Item")
+    etree.SubElement(item, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}Name").text = "Prestation / Marchandise"
+    item_tax = etree.SubElement(item, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}ClassifiedTaxCategory")
+    etree.SubElement(item_tax, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = data["tax_category_code"]
+    etree.SubElement(item_tax, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}Percent").text = f"{data['rate']:.2f}"
+    item_tax_scheme = etree.SubElement(item_tax, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}TaxScheme")
+    etree.SubElement(item_tax_scheme, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}ID").text = "VAT"
+
+    price = etree.SubElement(inv_line, "{urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2}Price")
+    etree.SubElement(price, "{urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2}PriceAmount", currencyID="EUR").text = f"{data['net_amount']:.2f}"
+
     return etree.tostring(root, pretty_print=True, xml_declaration=True, encoding="UTF-8")
 
 st.title("📂 PDF2UBL - Passerelle WinBooks / Virtual Invoice")
-st.write("Convertissez vos factures PDF en XML UBL 2.1 avec appariement automatique.")
+st.write("Convertissez vos factures PDF en XML UBL 2.1 avec affectation automatique des grilles TVA.")
 
 uploaded_files = st.file_uploader("Déposez une ou plusieurs factures PDF", type=["pdf"], accept_multiple_files=True)
+
+REGIMES = {
+    "Taux standard 21%": {"rate": 21.0, "code": "S", "reason": None},
+    "Taux réduit 6%": {"rate": 6.0, "code": "S", "reason": None},
+    "Taux intermédiaire 12%": {"rate": 12.0, "code": "S", "reason": None},
+    "Cocontractant (0% - Case 87)": {"rate": 0.0, "code": "K", "reason": "Autoliquidation - Art. 20 AR n°1"},
+    "Intracommunautaire (0% - Case 86)": {"rate": 0.0, "code": "K", "reason": "Autoliquidation intracommunautaire"},
+    "Exonéré / Art. 44 (0%)": {"rate": 0.0, "code": "E", "reason": "Exonéré TVA - Article 44"},
+}
 
 if uploaded_files:
     zip_buffer = io.BytesIO()
@@ -207,15 +227,17 @@ if uploaded_files:
                 issue_d = st.text_input("Date Facture (AAAA-MM-JJ)", value=parsed["issue_date"], key=f"date_{idx}")
                 due_d = st.text_input("Échéance (AAAA-MM-JJ)", value=parsed["due_date"], key=f"due_{idx}")
             with col4:
-                rates_available = [21.0, 12.0, 6.0, 0.0]
-                default_idx = rates_available.index(parsed["rate"]) if parsed["rate"] in rates_available else 0
-                chosen_rate = st.selectbox("Taux TVA (%)", rates_available, index=default_idx, key=f"rate_{idx}")
-                
+                regimes_keys = list(REGIMES.keys())
+                def_idx = regimes_keys.index(parsed["regime"]) if parsed["regime"] in regimes_keys else 0
+                chosen_regime = st.selectbox("Régime fiscal / Grille TVA", regimes_keys, index=def_idx, key=f"regime_{idx}")
+
                 ttc = st.number_input("Total TTC (€)", value=parsed["gross_amount"], step=0.01, format="%.2f", key=f"ttc_{idx}")
-                
-                # Recalcul automatique selon le taux choisi
-                if chosen_rate > 0:
-                    calc_ht = round(ttc / (1 + (chosen_rate / 100)), 2)
+
+                rate_info = REGIMES[chosen_regime]
+                r = rate_info["rate"]
+
+                if r > 0:
+                    calc_ht = round(ttc / (1 + (r / 100)), 2)
                     calc_tva = round(ttc - calc_ht, 2)
                 else:
                     calc_ht = ttc
@@ -231,7 +253,9 @@ if uploaded_files:
                 "vcs": vcs,
                 "issue_date": issue_d,
                 "due_date": due_d,
-                "rate": chosen_rate,
+                "rate": r,
+                "tax_category_code": rate_info["code"],
+                "exemption_reason": rate_info["reason"],
                 "net_amount": htva,
                 "tax_amount": tva,
                 "gross_amount": ttc,
